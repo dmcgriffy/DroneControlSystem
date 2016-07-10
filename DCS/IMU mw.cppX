@@ -1,0 +1,331 @@
+#include "Arduino.h"
+#include "i2c_t3.h"
+//#include "Wire.h"
+
+#include "MSP.h"
+#include "LED.h"
+
+extern int16_t debugVals[4];
+
+const int MPU=0x68;  // I2C address of the MPU-6050
+
+unsigned long last_imu;
+int16_t gyroOff[3] = {0, 0, 0}; // calibration results
+int16_t accOff[3] = {0, 0, 0};  // calibration resluts
+int16_t Acc[3], Gyro[3];        // raw IMU data
+int16_t Tmp;                    // raw temperature data
+int16_t IMURoll,IMUPitch,IMUHead; // cooked IMU data
+
+//--- math stuff from MultiWii
+
+typedef struct  {
+  int32_t X,Y,Z;
+} t_int32_t_vector_def;
+
+typedef struct  {
+  uint16_t XL; int16_t X;
+  uint16_t YL; int16_t Y;
+  uint16_t ZL; int16_t Z;
+} t_int16_t_vector_def;
+
+// note: we use implicit first 16 MSB bits 32 -> 16 cast. ie V32.X>>16 = V16.X
+typedef union {
+  int32_t A32[3];
+  t_int32_t_vector_def V32;
+  int16_t A16[6];
+  t_int16_t_vector_def V16;
+} t_int32_t_vector;
+
+//return angle , unit: 1/10 degree
+int16_t _atan2(int32_t y, int32_t x){
+  float z = y;
+  int16_t a;
+  uint8_t c;
+  c = abs(y) < abs(x);
+  if ( c ) {z = z / x;} else {z = x / z;}
+  a = 2046.43 * (z / (3.5714 +  z * z));
+  if ( c ){
+   if (x<0) {
+     if (y<0) a -= 1800;
+     else a += 1800;
+   }
+  } else {
+    a = 900 - a;
+    if (y<0) a -= 1800;
+  }
+  return a;
+}
+
+// signed16 * signed16
+// 22 cycles
+// http://mekonik.wordpress.com/2009/03/18/arduino-avr-gcc-multiplication/
+#define MultiS16X16to32(longRes, intIn1, intIn2) \
+asm volatile ( \
+"clr r26 \n\t" \
+"mul %A1, %A2 \n\t" \
+"movw %A0, r0 \n\t" \
+"muls %B1, %B2 \n\t" \
+"movw %C0, r0 \n\t" \
+"mulsu %B2, %A1 \n\t" \
+"sbc %D0, r26 \n\t" \
+"add %B0, r0 \n\t" \
+"adc %C0, r1 \n\t" \
+"adc %D0, r26 \n\t" \
+"mulsu %B1, %A2 \n\t" \
+"sbc %D0, r26 \n\t" \
+"add %B0, r0 \n\t" \
+"adc %C0, r1 \n\t" \
+"adc %D0, r26 \n\t" \
+"clr r1 \n\t" \
+: \
+"=&r" (longRes) \
+: \
+"a" (intIn1), \
+"a" (intIn2) \
+: \
+"r26" \
+)
+
+int32_t  __attribute__ ((noinline)) mul(int16_t a, int16_t b) {
+  int32_t r;
+  //MultiS16X16to32(r, a, b);
+  r = (int32_t)a*b; //without asm requirement
+  return r;
+}
+
+// Rotate Estimated vector(s) with small angle approximation, according to the gyro data
+uint8_t ROLL = 1;
+uint8_t PITCH = 0;
+uint8_t YAW = 2;
+void rotateV32( t_int32_t_vector *v,int16_t* delta) {
+  int16_t X = v->V16.X;
+  int16_t Y = v->V16.Y;
+  int16_t Z = v->V16.Z;
+
+  v->V32.Z -=  -mul(delta[ROLL]  ,  X)  + mul(delta[PITCH] , Y);
+  v->V32.X +=  -mul(delta[ROLL]  ,  Z)  - mul(delta[YAW]   , Y);
+  v->V32.Y +=   mul(delta[PITCH] ,  Z)  + mul(delta[YAW]   , X);
+}
+
+//--- end math stuff from MultiWii---
+
+//---------------------
+// read gyro and accel
+void requestIMU()
+{
+  Wire.beginTransmission(MPU);
+  Wire.write(0x3B);               // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(true);
+  Wire.requestFrom(MPU,14,true);  // request a total of 14 registers
+}
+
+//---------------------
+// read gyro only
+void requestGyro()
+{
+  Wire.beginTransmission(MPU);
+  Wire.write(0x43);               // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(true);
+  Wire.requestFrom(MPU,6,true);  // request a total of 6 registers
+}
+
+//---------------------
+// read available IMU bytes and process if full message
+uint8_t imuBufPos = 0;
+uint8_t imuBuf[14];
+void readIMU()
+{
+  // read the whole IMU set
+  while ((Wire.available() > 0) && (imuBufPos < 14))
+  {
+    imuBuf[imuBufPos++]=Wire.read();
+  }
+  if (imuBufPos == 14)  
+  {
+    // yes, read a new one after copy values, to allow for background operation
+    Acc[0]=imuBuf[0]<<8|imuBuf[1];    // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)     
+    Acc[1]=imuBuf[2]<<8|imuBuf[3];    // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+    Acc[2]=imuBuf[4]<<8|imuBuf[5];    // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+    Tmp=imuBuf[6]<<8|imuBuf[7];       // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
+    Gyro[0]=imuBuf[8]<<8|imuBuf[9];   // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+    Gyro[1]=imuBuf[10]<<8|imuBuf[11];  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+    Gyro[2]=imuBuf[12]<<8|imuBuf[13];  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L) 
+
+    requestIMU();
+    imuBufPos = 0;
+  }
+}
+
+//------------------------------
+// setup the IMU modules and do calibration
+#define ACC_1G (2048)
+void initIMU()
+{
+  // initialize the MPU6050
+  Wire.begin();
+  //TWBR = ((F_CPU / 400000) - 16) / 2;          // set the I2C clock rate to 400kHz
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);Wire.write(0x80);     // reset to default
+  Wire.endTransmission(true);
+  delay(50);
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);Wire.write(0x03);     // SLEEP 0; CYCLE 0; TEMP_DIS 0; CLKSEL 3 (PLL with Z Gyro reference)
+  Wire.endTransmission(true);
+  delay(50);
+  Wire.beginTransmission(MPU);
+  Wire.write(0x1a);Wire.write(0x03);     // EXT_SYNC_SET 0 (disable input pin for data sync) ; default DLPF_CFG = 0 => ACC bandwidth = 260Hz  GYRO bandwidth = 256Hz)
+  Wire.write(0x1b);Wire.write(0x18);     // FS_SEL = 3: Full scale set to 2000 deg/sec
+  Wire.write(0x1c);Wire.write(0x10);     // ACCEL_CONFIG  -- AFS_SEL=2 (Full Scale = +/-8G)  ; ACCELL_HPF=0   //note something is wrong in the spec.
+  Wire.endTransmission(true);
+  requestIMU();
+
+  // calibrate gyro by repeatedly taking the average of blocks of readings
+  // until the XY vibration is low enough
+  #define CALIBBLOCKSIZE (128)
+  bool calibGood = false;
+  int32_t gyroSum[3] = {0, 0, 0};
+  int32_t accSum[3] = {0, 0, 0};
+  int32_t vibSum;
+  LEDPIN_ON;
+  while (!calibGood)
+  {
+    for (int i=0; i<3; i++)
+    {
+      gyroSum[i] = 0;
+      accSum[i] = 0;
+    }
+    vibSum = 0;
+    delay(1000);
+    readIMU();
+    for (int i=0; i<CALIBBLOCKSIZE; i++)
+    {
+      delay(3);
+      readIMU();
+      for (int j=0; j<3; j++)
+      {
+        gyroSum[j] += Gyro[j];
+        accSum[j] += Acc[j];
+      }
+      vibSum = abs(Acc[0] + accOff[0]) + abs(Acc[1] + accOff[1]);// + abs(Acc[2] - accOff[2]);
+    }
+    for (int j=0; j<3; j++)
+    {
+      gyroOff[j] = -(gyroSum[j] / CALIBBLOCKSIZE);
+      accOff[j]  = -(accSum[j]  / CALIBBLOCKSIZE);
+    }
+    calibGood = vibSum < 10;
+  }
+  accOff[2] += ACC_1G;
+  LEDPIN_OFF;
+}
+
+#define GYRO_SCALE (4 / 16.4 * PI / 180.0 / 1000000.0) //16.4 LSB = 1 deg/s
+#define ACCLPFFACTOR (2)
+#define GYLPFFACTOR (1)
+int16_t accSmooth[3] = {0, 0, 0};
+int16_t gySmooth[3] = {0, 0, 0};
+int16_t gySmoothDelta[3];
+t_int32_t_vector EstG = {0,0,(int32_t)ACC_1G<<16};
+t_int32_t_vector EstM = {0,(int32_t)1<<24,0};
+void calcIMU()
+{
+
+  // acc smoothing
+  if (true)
+  {
+    accSmooth[0] = accSmooth[0] - (accSmooth[0]>>ACCLPFFACTOR) + (Acc[0]>>ACCLPFFACTOR);
+    accSmooth[1] = accSmooth[1] - (accSmooth[1]>>ACCLPFFACTOR) + (Acc[1]>>ACCLPFFACTOR);
+    accSmooth[2] = accSmooth[2] - (accSmooth[2]>>ACCLPFFACTOR) + (Acc[2]>>ACCLPFFACTOR);
+  } else {
+    accSmooth[0] = Acc[0];
+    accSmooth[1] = Acc[1];
+    accSmooth[2] = Acc[2];
+  }
+  
+  // gyro smoothing
+  if (false)
+  {
+    gySmooth[0] = gySmooth[0] - (gySmooth[0]>>GYLPFFACTOR) + (Gyro[0]>>GYLPFFACTOR);
+    gySmooth[1] = gySmooth[1] - (gySmooth[1]>>GYLPFFACTOR) + (Gyro[1]>>GYLPFFACTOR);
+    gySmooth[2] = gySmooth[2] - (gySmooth[2]>>GYLPFFACTOR) + (Gyro[2]>>GYLPFFACTOR);
+  } else {
+    gySmooth[0] = Gyro[0];
+    gySmooth[1] = Gyro[1];
+    gySmooth[2] = Gyro[2];
+  }
+  
+  // apply time delta
+  unsigned long new_imu = micros();
+  unsigned long delta_imu = new_imu - last_imu;
+  last_imu = new_imu;
+  float scale = delta_imu * GYRO_SCALE * 65536;
+  int32_t accMag = 0;
+  for (int i=0; i<3; i++)
+  {
+    gySmoothDelta[i] = (gySmooth[i] + gyroOff[i]) * scale / 4;
+    //gySmoothDelta[i] = ((gySmooth[i] * delta_imu)>>10);
+    accMag += mul(accSmooth[i] , accSmooth[i]);
+  } 
+
+  // rotate 'down' based on gyro
+  rotateV32(&EstG,gySmoothDelta);
+  rotateV32(&EstM,gySmoothDelta);
+
+  // complimentary filter
+  if ( (int16_t)(0.85*ACC_1G*ACC_1G/256) < (int16_t)(accMag>>8) && (int16_t)(accMag>>8) < (int16_t)(1.15*ACC_1G*ACC_1G/256) )
+    for (int i=0; i<3; i++)
+      EstG.A32[i] = (int32_t)((accSmooth[i] + accOff[i] + EstG.A16[2*i+1] + EstG.A16[2*i+1] + EstG.A16[2*i+1]))<<14;
+
+//  debugVals[0] = accSmooth[1];
+//  debugVals[1] = accOff[1];
+//  debugVals[2] = EstG.A16[3];
+  
+  // convert vectors to angles
+  #define ACCZ_25deg   (int16_t)(ACC_1G * 0.90631) // 0.90631 = cos(25deg) (cos(theta) of accZ comparison)
+  //int32_t sqGX_sqGZ = mul(EstG.V16.X,EstG.V16.X) + mul(EstG.V16.Z,EstG.V16.Z);
+  //float invG = InvSqrt(sqGX_sqGZ + mul(EstG.V16.Y,EstG.V16.Y));
+  IMURoll = -_atan2(EstG.V16.Y , EstG.V16.Z)/10;
+  IMUPitch = _atan2(EstG.V16.X , EstG.V16.Z)/10;
+//  IMUHead = _atan2(
+//    mul(EstM.V16.Z , EstG.V16.X) - mul(EstM.V16.X , EstG.V16.Z),
+//    (EstM.V16.Y * sqGX_sqGZ  - (mul(EstM.V16.X , EstG.V16.X) + mul(EstM.V16.Z , EstG.V16.Z)) * EstG.V16.Y)*invG )/10;
+  IMUHead = _atan2(EstM.V16.X, EstM.V16.Y)/10;
+//  IMURoll = EstG.A16[1];
+//  IMUPitch = EstG.A16[3];
+//  IMUHead = EstG.A16[5];
+//  IMURoll = gySmoothDelta[0];
+//  IMUPitch = gySmoothDelta[1];
+//  IMUHead = gySmoothDelta[2];
+//IMUHead = 0;
+
+}
+
+void writeMSP_RAW_IMU() {
+    mspWriteStart(MSP_RAW_IMU);
+    for (int i=0; i<3; i++)
+    {
+      mspWriteWord(Acc[i]/4);
+      //mspWriteWord(gyroOff[i]);
+    }
+    mspWriteWord(Tmp/340.00+36.53);  //equation for temperature in degrees C from datasheet
+    for (int i=0; i<3; i++)
+    {
+      //mspWriteWord(Gyro[i]);
+      mspWriteWord(gySmoothDelta[i]);
+      //mspWriteWord(gyroOff[i]);
+      //mspWriteWord((int16_t)(100.0f*axisCmdPID[i]));
+    }
+//      mspWriteWord(Gyro[2]);
+//      mspWriteWord(gyroOff[2]);
+//      mspWriteWord(gySmoothDelta[2]);
+    mspWriteEnd();  
+}
+
+void writeMSP_ATTITUDE() {
+    mspWriteStart(MSP_ATTITUDE);
+    mspWriteWord(IMURoll);
+    mspWriteWord(IMUPitch);
+    mspWriteWord(IMUHead);
+    mspWriteEnd();
+}
+
